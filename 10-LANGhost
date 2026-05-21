@@ -1,0 +1,223 @@
+#!/bin/bash
+set -u
+
+HOSTNAMES_FILE="/etc/NetworkManager/dispatcher.d/hostnames.txt"
+LOG="/tmp/LANGhost.log"
+STATE_DIR="/run/LANGhost"
+mkdir -p "$STATE_DIR"
+
+log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
+
+IFACE="${1:-}"
+EVENT="${2:-}"
+[ -n "$IFACE" ] || exit 0
+
+case "$IFACE" in
+    wlan*|eth*|enp*|wlp*|wlan*|wl*|en* ) ;;
+    *) exit 0 ;;
+esac
+
+is_armed() {
+    [ -f "$STATE_DIR/$IFACE.armed" ]
+}
+
+is_killswitched() {
+    [ -f "$STATE_DIR/$IFACE.killswitched" ]
+}
+
+mark_killswitched() {
+    : > "$STATE_DIR/$IFACE.killswitched"
+}
+
+clear_runtime_state() {
+    rm -f \
+        "$STATE_DIR/$IFACE.tc" \
+        "$STATE_DIR/$IFACE.hostname" \
+        "$STATE_DIR/$IFACE.session_seed" \
+        "$STATE_DIR/$IFACE.armed" \
+        "$STATE_DIR/$IFACE.killswitched"
+}
+
+quarantine_iface() {
+    tc qdisc replace dev "$IFACE" clsact >/dev/null 2>&1 || true
+    tc filter replace dev "$IFACE" egress pref 1 matchall action drop >/dev/null 2>&1 || true
+    tc filter replace dev "$IFACE" ingress pref 1 matchall action drop >/dev/null 2>&1 || true
+    echo 1 > "$STATE_DIR/$IFACE.tc"
+    log "Quarantine applied on $IFACE"
+}
+
+release_iface() {
+    tc filter del dev "$IFACE" egress pref 1 >/dev/null 2>&1 || true
+    tc filter del dev "$IFACE" ingress pref 1 >/dev/null 2>&1 || true
+    tc qdisc del dev "$IFACE" clsact >/dev/null 2>&1 || true
+    rm -f "$STATE_DIR/$IFACE.tc"
+    log "Quarantine released on $IFACE"
+}
+
+persist_driver_binding() {
+    local dev_path driver_path bus_id driver_name
+    dev_path="$(readlink -f "/sys/class/net/$IFACE/device" 2>/dev/null || true)"
+    [ -n "$dev_path" ] || return 0
+
+    driver_path="$(readlink -f "$dev_path/driver" 2>/dev/null || true)"
+    [ -n "$driver_path" ] || return 0
+
+    bus_id="$(basename "$dev_path")"
+    driver_name="$(basename "$driver_path")"
+
+    printf '%s\n' "$bus_id" > "$STATE_DIR/$IFACE.driver_bus_id"
+    printf '%s\n' "$driver_name" > "$STATE_DIR/$IFACE.driver_name"
+    printf '%s\n' "$driver_path" > "$STATE_DIR/$IFACE.driver_path"
+}
+
+engage_driver_killswitch() {
+    local dev_path driver_path bus_id driver_name unbind_path
+    dev_path="$(readlink -f "/sys/class/net/$IFACE/device" 2>/dev/null || true)"
+    [ -n "$dev_path" ] || { log "Driver kill-switch unavailable on $IFACE: no sysfs device path"; return 0; }
+
+    driver_path="$(readlink -f "$dev_path/driver" 2>/dev/null || true)"
+    [ -n "$driver_path" ] || { log "Driver kill-switch unavailable on $IFACE: no bound driver"; return 0; }
+
+    bus_id="$(basename "$dev_path")"
+    driver_name="$(basename "$driver_path")"
+    unbind_path="$driver_path/unbind"
+
+    persist_driver_binding
+
+    if [ -w "$unbind_path" ]; then
+        if printf '%s' "$bus_id" > "$unbind_path" 2>/dev/null; then
+            echo 1 > "$STATE_DIR/$IFACE.driver_unbound"
+            log "Driver kill-switch engaged on $IFACE: driver=$driver_name bus_id=$bus_id"
+            return 0
+        fi
+        log "Driver kill-switch write failed on $IFACE: driver=$driver_name bus_id=$bus_id"
+        return 1
+    fi
+
+    log "Driver kill-switch unavailable on $IFACE: $unbind_path not writable"
+    return 1
+}
+
+hard_fail() {
+    log "FAIL-CLOSED on $IFACE: $*"
+    mark_killswitched
+    quarantine_iface
+    nmcli device disconnect "$IFACE" >/dev/null 2>&1 || true
+    ip link set "$IFACE" down >/dev/null 2>&1 || true
+    if command -v rfkill >/dev/null 2>&1 && [[ "$IFACE" == wl* || "$IFACE" == wlan* ]]; then
+        rfkill block wifi >/dev/null 2>&1 || true
+    fi
+    engage_driver_killswitch || true
+    exit 1
+}
+
+get_active_uuid() {
+    nmcli -t -f UUID,DEVICE connection show --active 2>/dev/null \
+        | awk -F: -v d="$IFACE" '$2==d {print $1; exit}'
+}
+
+get_prop() {
+    local uuid="$1" key="$2"
+    nmcli -g "$key" connection show "$uuid" 2>/dev/null || true
+}
+
+value_in() {
+    local value="$1"; shift || true
+    local candidate
+    for candidate in "$@"; do
+        [ "$value" = "$candidate" ] && return 0
+    done
+    return 1
+}
+
+verify_runtime_identity() {
+    local uuid con_type current_mac perm_mac hostname_expect hostname_now session_seed stable_id
+    local ip4_client_id ip4_iaid ip6_addr_gen ip6_privacy ip6_duid ip6_iaid llmnr mdns lldp
+
+    uuid="$(get_active_uuid || true)"
+    [ -n "$uuid" ] || hard_fail "No active UUID for $IFACE after activation grace period"
+
+    con_type="$(get_prop "$uuid" connection.type)"
+    current_mac="$(cat /sys/class/net/"$IFACE"/address 2>/dev/null || true)"
+    [ -n "$current_mac" ] || hard_fail "Unable to read current MAC"
+
+    if command -v ethtool >/dev/null 2>&1; then
+        perm_mac="$(ethtool -P "$IFACE" 2>/dev/null | awk '/Permanent address:/ {print tolower($3)}')"
+        if [ -n "$perm_mac" ] && [ "$perm_mac" = "${current_mac,,}" ]; then
+            hard_fail "Current MAC matches permanent MAC ($current_mac)"
+        fi
+    fi
+
+    case "$con_type" in
+        802-11-wireless|wifi)
+            [ "$(get_prop "$uuid" 802-11-wireless.cloned-mac-address)" = "random" ] \
+                || hard_fail "Wi-Fi profile is not set to random MAC"
+            ;;
+        802-3-ethernet|ethernet)
+            [ "$(get_prop "$uuid" 802-3-ethernet.cloned-mac-address)" = "random" ] \
+                || hard_fail "Ethernet profile is not set to random MAC"
+            ;;
+    esac
+
+    hostname_expect="$(cat "$STATE_DIR/$IFACE.hostname" 2>/dev/null || true)"
+    hostname_now="$(get_prop "$uuid" ipv4.dhcp-hostname)"
+    if [ -n "$hostname_expect" ] && [ "$hostname_now" != "$hostname_expect" ]; then
+        hard_fail "DHCP hostname mismatch ($hostname_now != $hostname_expect)"
+    fi
+
+    session_seed="$(cat "$STATE_DIR/$IFACE.session_seed" 2>/dev/null || true)"
+    stable_id="$(get_prop "$uuid" connection.stable-id)"
+    if [ -n "$session_seed" ] && [ "$stable_id" != "$session_seed" ]; then
+        hard_fail "Stable identity seed mismatch ($stable_id != $session_seed)"
+    fi
+
+    ip4_client_id="$(get_prop "$uuid" ipv4.dhcp-client-id)"
+    value_in "$ip4_client_id" mac || hard_fail "IPv4 DHCP client-id policy is not mac ($ip4_client_id)"
+
+    ip4_iaid="$(get_prop "$uuid" ipv4.dhcp-iaid)"
+    [ -n "$ip4_iaid" ] || hard_fail "IPv4 DHCP IAID is not set"
+
+    ip6_addr_gen="$(get_prop "$uuid" ipv6.addr-gen-mode)"
+    value_in "$ip6_addr_gen" stable-privacy 1 || hard_fail "IPv6 addr-gen-mode is not stable-privacy ($ip6_addr_gen)"
+
+    ip6_privacy="$(get_prop "$uuid" ipv6.ip6-privacy)"
+    value_in "$ip6_privacy" 2 prefer-temp-addr || hard_fail "IPv6 privacy extensions are not set to prefer temporary addresses ($ip6_privacy)"
+
+    ip6_duid="$(get_prop "$uuid" ipv6.dhcp-duid)"
+    value_in "$ip6_duid" stable-uuid || hard_fail "IPv6 DHCP DUID policy is not stable-uuid ($ip6_duid)"
+
+    ip6_iaid="$(get_prop "$uuid" ipv6.dhcp-iaid)"
+    [ -n "$ip6_iaid" ] || hard_fail "IPv6 DHCP IAID is not set"
+
+    llmnr="$(get_prop "$uuid" connection.llmnr)"
+    value_in "$llmnr" 0 no || hard_fail "LLMNR is not disabled ($llmnr)"
+
+    mdns="$(get_prop "$uuid" connection.mdns)"
+    value_in "$mdns" 0 no || hard_fail "mDNS is not disabled ($mdns)"
+
+    lldp="$(get_prop "$uuid" connection.lldp)"
+    value_in "$lldp" 0 disable || hard_fail "LLDP is not disabled ($lldp)"
+
+    log "Verified runtime identity for $IFACE: MAC=$current_mac hostname=${hostname_now:-unset} UUID=$uuid stable_id=${stable_id:-unset}"
+}
+
+case "$EVENT" in
+    up)
+        is_armed || exit 0
+        verify_runtime_identity
+        rm -f "$STATE_DIR/$IFACE.killswitched" "$STATE_DIR/$IFACE.armed"
+        ;;
+    down|pre-down|vpn-down)
+        if is_killswitched; then
+            log "Preserving kill-switch on $IFACE during $EVENT"
+            exit 0
+        fi
+        if is_armed; then
+            release_iface
+            clear_runtime_state
+        fi
+        ;;
+    *)
+        exit 0
+        ;;
+esac
